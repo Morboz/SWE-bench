@@ -116,6 +116,11 @@ def build_image(
                 )
 
         # Write the dockerfile to the build directory
+        # Strip --platform flag from FROM lines on old Docker (< API 1.41)
+        api_version = float(client.version()["ApiVersion"])
+        if api_version < 1.41:
+            import re
+            dockerfile = re.sub(r"FROM\s+--platform=\S+\s+", "FROM ", dockerfile)
         dockerfile_path = build_dir / "Dockerfile"
         with open(dockerfile_path, "w") as f:
             f.write(dockerfile)
@@ -124,15 +129,17 @@ def build_image(
         logger.info(
             f"Building docker image {image_name} in {build_dir} with platform {platform}"
         )
-        response = client.api.build(
+        build_kwargs = dict(
             path=str(build_dir),
             tag=image_name,
             rm=True,
             forcerm=True,
             decode=True,
-            platform=platform,
             nocache=nocache,
         )
+        if api_version >= 1.41:
+            build_kwargs["platform"] = platform
+        response = client.api.build(**build_kwargs)
 
         # Log the build process continuously
         buildlog = ""
