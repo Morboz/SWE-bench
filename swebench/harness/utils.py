@@ -7,10 +7,9 @@ import swebench.resources
 
 from argparse import ArgumentTypeError
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datasets import Dataset, load_dataset, load_from_disk
-from dotenv import load_dotenv
 from pathlib import Path
 from typing import cast
+from dotenv import load_dotenv
 from swebench.harness.constants import (
     SWEbenchInstance,
     KEY_INSTANCE_ID,
@@ -145,7 +144,8 @@ def load_swebench_dataset(
     elif name.endswith(".jsonl"):
         dataset = [json.loads(line) for line in Path(name).read_text().splitlines()]
     elif name.endswith(".parquet"):
-        dataset = cast(Dataset, load_dataset("parquet", data_files=name, split="train"))
+        from datasets import load_dataset
+        dataset = load_dataset("parquet", data_files=name, split="train")
     else:
         # Load from Hugging Face Datasets
         if name.lower() in {"swe-bench", "swebench", "swe_bench"}:
@@ -160,11 +160,14 @@ def load_swebench_dataset(
             name = "SWE-bench/SWE-bench_Lite"
         parquet_path = Path(name) / f"{split}.parquet"
         if parquet_path.exists():
-            dataset = cast(Dataset, load_dataset("parquet", data_files=str(parquet_path), split="train"))
+            from datasets import load_dataset
+            dataset = load_dataset("parquet", data_files=str(parquet_path), split="train")
         elif (Path(name) / split / "dataset_info.json").exists():
-            dataset = cast(Dataset, load_from_disk(Path(name) / split))
+            from datasets import load_from_disk
+            dataset = load_from_disk(Path(name) / split)
         else:
-            dataset = cast(Dataset, load_dataset(name, split=split))
+            from datasets import load_dataset
+            dataset = load_dataset(name, split=split)
     dataset_ids = {instance[KEY_INSTANCE_ID] for instance in dataset}
     if instance_ids:
         if instance_ids - dataset_ids:
