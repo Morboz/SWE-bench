@@ -520,15 +520,18 @@ def build_container(
         run_args = test_spec.docker_specs.get("run_args", {})
         cap_add = run_args.get("cap_add", [])
 
-        container = client.containers.create(
+        create_kwargs = dict(
             image=test_spec.instance_image_key,
             name=test_spec.get_instance_container_name(run_id),
             user=DOCKER_USER,
             detach=True,
             command="tail -f /dev/null",
-            platform=test_spec.platform,
             cap_add=cap_add,
         )
+        api_version = float(client.version()["ApiVersion"])
+        if api_version >= 1.41:
+            create_kwargs["platform"] = test_spec.platform
+        container = client.containers.create(**create_kwargs)
         logger.info(f"Container for {test_spec.instance_id} created: {container.id}")
         return container
     except Exception as e:
