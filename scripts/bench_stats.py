@@ -35,6 +35,8 @@ EVAL_STATUS_ORDER = (
     ("incomplete", "incomplete_ids"),
 )
 
+PATCH_PRODUCED_RESULTS = {"resolved", "unresolved", "completed", "submitted"}
+
 
 def _safe_int(value: Any) -> int:
     if value is None:
@@ -171,10 +173,78 @@ def build_eval_summary(path: Path | None) -> dict[str, Any] | None:
     return {field: _safe_int(data.get(field)) for field in fields}
 
 
+def build_eval_summary_for_ids(result_map: dict[str, str], instance_ids: set[str]) -> dict[str, Any]:
+    summary = {
+        "total_instances": 0,
+        "submitted_instances": 0,
+        "completed_instances": 0,
+        "resolved_instances": 0,
+        "unresolved_instances": 0,
+        "empty_patch_instances": 0,
+        "error_instances": 0,
+    }
+    for instance_id in instance_ids:
+        status = result_map.get(instance_id)
+        if status is None:
+            continue
+        summary["total_instances"] += 1
+        if status in {"submitted", "completed", "resolved", "unresolved", "empty_patch"}:
+            summary["submitted_instances"] += 1
+        if status in {"completed", "resolved", "unresolved"}:
+            summary["completed_instances"] += 1
+        if status == "resolved":
+            summary["resolved_instances"] += 1
+        elif status == "unresolved":
+            summary["unresolved_instances"] += 1
+        elif status == "empty_patch":
+            summary["empty_patch_instances"] += 1
+        elif status == "error":
+            summary["error_instances"] += 1
+    return summary
+
+
 def is_patch_correct(eval_result: str | None) -> bool | None:
     if eval_result is None:
         return None
     return eval_result == "resolved"
+
+
+def has_token_usage(row: TaskStats) -> bool:
+    return row.total_tokens > 0
+
+
+def has_patch_result(eval_result: str | None) -> bool:
+    return eval_result in PATCH_PRODUCED_RESULTS
+
+
+def get_comparison_instance_ids(
+    left_rows: dict[str, TaskStats],
+    right_rows: dict[str, TaskStats],
+    left_eval_results: dict[str, str] | None = None,
+    right_eval_results: dict[str, str] | None = None,
+    *,
+    intersection: bool = False,
+) -> list[str]:
+    shared_ids = sorted(set(left_rows) & set(right_rows))
+    if not intersection:
+        return shared_ids
+
+    left_eval_results = left_eval_results or {}
+    right_eval_results = right_eval_results or {}
+    require_patch_intersection = bool(left_eval_results) and bool(right_eval_results)
+    filtered_ids: list[str] = []
+    for instance_id in shared_ids:
+        left = left_rows[instance_id]
+        right = right_rows[instance_id]
+        if not has_token_usage(left) or not has_token_usage(right):
+            continue
+        if require_patch_intersection and (
+            not has_patch_result(left_eval_results.get(instance_id))
+            or not has_patch_result(right_eval_results.get(instance_id))
+        ):
+            continue
+        filtered_ids.append(instance_id)
+    return filtered_ids
 
 
 def build_comparison_rows(
@@ -182,10 +252,11 @@ def build_comparison_rows(
     right_rows: dict[str, TaskStats],
     left_eval_results: dict[str, str] | None = None,
     right_eval_results: dict[str, str] | None = None,
+    instance_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     left_eval_results = left_eval_results or {}
     right_eval_results = right_eval_results or {}
-    shared_ids = sorted(set(left_rows) & set(right_rows))
+    shared_ids = instance_ids if instance_ids is not None else sorted(set(left_rows) & set(right_rows))
     rows = []
     for instance_id in shared_ids:
         left = left_rows[instance_id]
@@ -226,6 +297,7 @@ def build_comparison_summary(
     comparison_rows: list[dict[str, Any]],
     left_eval_summary: dict[str, Any] | None = None,
     right_eval_summary: dict[str, Any] | None = None,
+    filtered_shared_tasks: int = 0,
 ) -> dict[str, Any]:
     summary = {
         "left_tasks": len(left_rows),
@@ -246,6 +318,8 @@ def build_comparison_summary(
         "right_total_tokens": sum(right_rows[row["instance_id"]].total_tokens for row in comparison_rows),
         "total_tokens_diff": sum(row["total_tokens_diff"] for row in comparison_rows),
     }
+    if filtered_shared_tasks:
+        summary["filtered_shared_tasks"] = filtered_shared_tasks
     if left_eval_summary is not None:
         summary["left_eval_summary"] = left_eval_summary
     if right_eval_summary is not None:
@@ -362,6 +436,8 @@ def render_comparison_table(rows: list[dict[str, Any]], summary: dict[str, Any])
         f"right_api_calls={summary['right_api_calls']} "
         f"api_calls_diff={summary['api_calls_diff']}"
     )
+    if "filtered_shared_tasks" in summary:
+        table_lines[-1] += f" filtered_shared_tasks={summary['filtered_shared_tasks']}"
     if "left_eval_summary" in summary:
         eval_summary = summary["left_eval_summary"]
         table_lines.append(
@@ -428,9 +504,14 @@ def parse_args() -> argparse.Namespace:
         description="Summarize mini-SWE-agent bench trajectories by task, token usage, and API call count."
     )
     parser.add_argument("path", type=Path, help="Bench directory or a single .traj.json file")
-    parser.add_argument("compare_path", type=Path, nargs="?", help="Optional second bench directory for intersection-only comparison")
+    parser.add_argument("compare_path", type=Path, nargs="?", help="Optional second bench directory for comparison")
     parser.add_argument("--left-eval", type=Path, help="Optional eval JSON for the first path in compare mode")
     parser.add_argument("--right-eval", type=Path, help="Optional eval JSON for the second path in compare mode")
+    parser.add_argument(
+        "--intersection",
+        action="store_true",
+        help="In compare mode, only keep tasks where both sides have token usage; if both eval files are provided, also require both sides to have a non-empty patch result.",
+    )
     parser.add_argument(
         "--format",
         choices=("table", "json", "csv"),
@@ -465,9 +546,31 @@ def main() -> int:
         left_eval_summary = build_eval_summary(args.left_eval)
         right_eval_summary = build_eval_summary(args.right_eval)
 
-        rows = build_comparison_rows(left_rows, right_rows, left_eval_results, right_eval_results)
+        instance_ids = get_comparison_instance_ids(
+            left_rows,
+            right_rows,
+            left_eval_results,
+            right_eval_results,
+            intersection=args.intersection,
+        )
+        filtered_shared_tasks = len(set(left_rows) & set(right_rows)) - len(instance_ids)
+        if args.intersection:
+            selected_ids = set(instance_ids)
+            if args.left_eval is not None:
+                left_eval_summary = build_eval_summary_for_ids(left_eval_results, selected_ids)
+            if args.right_eval is not None:
+                right_eval_summary = build_eval_summary_for_ids(right_eval_results, selected_ids)
+
+        rows = build_comparison_rows(left_rows, right_rows, left_eval_results, right_eval_results, instance_ids)
         rows.sort(key=lambda row: get_comparison_sort_value(row, args.sort_by), reverse=args.descending)
-        summary = build_comparison_summary(left_rows, right_rows, rows, left_eval_summary, right_eval_summary)
+        summary = build_comparison_summary(
+            left_rows,
+            right_rows,
+            rows,
+            left_eval_summary,
+            right_eval_summary,
+            filtered_shared_tasks=filtered_shared_tasks if args.intersection else 0,
+        )
 
         if args.format == "json":
             result = json.dumps({"summary": summary, "tasks": rows}, ensure_ascii=False, indent=2)
